@@ -38,6 +38,12 @@ import org.openmetadata.service.util.TestUtils;
 public abstract class BaseServiceIT<T extends EntityInterface, K extends CreateEntity>
     extends BaseEntityIT<T, K> {
 
+  // The flat column_search_index propagates slower than table_search_index, so allow a generous
+  // budget for descendant docs to appear/disappear under concurrent CI load.
+  private static final Duration SEARCH_INDEXED_TIMEOUT = Duration.ofSeconds(120);
+  private static final Duration SUBTREE_HARD_DELETE_TIMEOUT = Duration.ofSeconds(180);
+  private static final Duration SEARCH_DOC_REMOVED_TIMEOUT = Duration.ofSeconds(120);
+
   // Services typically don't support patch, don't have search indices, and don't need tag testing
   {
     supportsPatch = false;
@@ -201,7 +207,7 @@ public abstract class BaseServiceIT<T extends EntityInterface, K extends CreateE
 
     for (SearchDoc sd : subtree.searchDocs()) {
       Awaitility.await("descendant indexed in search before delete: " + sd.index())
-          .atMost(Duration.ofSeconds(60))
+          .atMost(SEARCH_INDEXED_TIMEOUT)
           .pollInterval(Duration.ofSeconds(1))
           .ignoreExceptions()
           .untilAsserted(
@@ -216,7 +222,7 @@ public abstract class BaseServiceIT<T extends EntityInterface, K extends CreateE
 
     // (1) The whole subtree is hard-deleted (async — poll until the service is gone).
     Awaitility.await("service subtree hard-deleted")
-        .atMost(Duration.ofSeconds(180))
+        .atMost(SUBTREE_HARD_DELETE_TIMEOUT)
         .pollInterval(Duration.ofMillis(500))
         .untilAsserted(() -> assertThrows(Exception.class, () -> getEntity(subtree.serviceId())));
 
@@ -234,7 +240,7 @@ public abstract class BaseServiceIT<T extends EntityInterface, K extends CreateE
     // the search-skip optimization relies on — one per hierarchy level the subtree opts to guard).
     for (SearchDoc sd : subtree.searchDocs()) {
       Awaitility.await("descendant search doc removed: " + sd.index())
-          .atMost(Duration.ofSeconds(90))
+          .atMost(SEARCH_DOC_REMOVED_TIMEOUT)
           .pollInterval(Duration.ofSeconds(1))
           .ignoreExceptions()
           .untilAsserted(
