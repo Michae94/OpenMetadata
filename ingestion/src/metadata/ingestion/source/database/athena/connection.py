@@ -13,37 +13,140 @@
 Source connection handler
 """
 
-from functools import partial
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from urllib.parse import quote_plus
 
+from botocore.exceptions import ClientError
 from sqlalchemy.engine import Engine
-from sqlalchemy.engine.reflection import Inspector
-from sqlalchemy.inspection import inspect
 
 from metadata.clients.aws_client import AWSClient
-from metadata.generated.schema.entity.automations.workflow import (
-    Workflow as AutomationWorkflow,
+from metadata.core.connections.test_connection import (
+    ErrorPack,
+    Matchers,
+    check,
+    when,
 )
+from metadata.core.connections.test_connection.checks.database import (
+    DatabaseStep,
+    list_schemas,
+    list_tables,
+    list_views,
+    run_sql,
+)
+from metadata.core.connections.test_connection.classifier import exception_chain
+from metadata.core.connections.test_connection.network import NETWORK_ERRORS
 from metadata.generated.schema.entity.services.connections.database.athenaConnection import (
     AthenaConnection as AthenaConnectionConfig,
-)
-from metadata.generated.schema.entity.services.connections.testConnectionResult import (
-    TestConnectionResult,
 )
 from metadata.ingestion.connections.builders import (
     create_generic_db_connection,
     get_connection_args_common,
 )
 from metadata.ingestion.connections.connection import BaseConnection
-from metadata.ingestion.connections.test_connections import (
-    execute_inspector_func,
-    test_connection_engine_step,
-    test_connection_steps,
-)
-from metadata.ingestion.ometa.ometa_api import OpenMetadata
-from metadata.ingestion.source.connections_utils import kill_active_connections
-from metadata.utils.constants import THREE_MIN
+
+if TYPE_CHECKING:
+    from metadata.core.connections.test_connection import ChecksProvider
+    from metadata.core.connections.test_connection.classifier import Matcher
+    from metadata.core.connections.test_connection.records import Evidence
+
+
+def _message(error: BaseException) -> str:
+    """The lower-cased text of the error and its cause chain."""
+    return " ".join(str(current) for current in exception_chain(error)).lower()
+
+
+def _aws_error_code(error: BaseException) -> str | None:
+    """The botocore ``ClientError`` code anywhere in the cause chain.
+
+    pyathena wraps a botocore ``ClientError`` raised by the underlying AWS call;
+    SQLAlchemy then wraps that, so the actionable code (``AccessDeniedException``
+    and friends) only survives by walking the chain."""
+    code = None
+    for current in exception_chain(error):
+        if isinstance(current, ClientError):
+            code = current.response.get("Error", {}).get("Code")
+            break
+    return code
+
+
+def _aws_code(*codes: str) -> Matcher:
+    """Match a botocore ``ClientError`` code - the stable signal for an AWS-side
+    rejection, where the rendered message text varies."""
+    wanted = frozenset(codes)
+    return lambda error: _aws_error_code(error) in wanted
+
+
+def _all_of(*tokens: str) -> Matcher:
+    """Match when every token is present in the error's cause-chain text."""
+    return lambda error: all(token in _message(error) for token in tokens)
+
+
+# Athena's transport is HTTPS to the regional AWS endpoint over botocore, so auth
+# and permission failures surface as botocore ``ClientError``s matched by
+# code/message, not driver errnos. NETWORK_ERRORS is still folded in so a genuine
+# DNS/socket failure to the endpoint is typed rather than left raw.
+ATHENA_ERRORS = ErrorPack(
+    when(
+        _aws_code(
+            "AccessDeniedException",
+            "UnrecognizedClientException",
+            "InvalidSignatureException",
+            "AuthFailure",
+        )
+    ).diagnose(
+        "Authentication failed",
+        fix="Check the AWS credentials (access key, secret, session token, or assume-role ARN) "
+        "and that the IAM principal is allowed to call Athena.",
+    ),
+    when(_all_of("workgroup", "is not found")).diagnose(
+        "Workgroup not found",
+        fix="Verify the configured workgroup exists in this account and region.",
+    ),
+    when(Matchers.contains("output location")).diagnose(
+        "Query result location not configured",
+        fix="Set s3StagingDir to an S3 path the principal can write to, or configure a query "
+        "result location on the workgroup.",
+    ),
+    when(Matchers.contains("could not connect to the endpoint")).diagnose(
+        "Cannot reach the AWS Athena endpoint",
+        fix="Check that awsRegion is correct and that the Athena endpoint is reachable from where ingestion runs.",
+    ),
+    when(Matchers.contains("not authorized")).diagnose(
+        "Not authorized",
+        fix="Grant the IAM principal the required Athena and Glue permissions "
+        "(e.g. athena:StartQueryExecution, glue:GetDatabases, glue:GetTables).",
+    ),
+).including(NETWORK_ERRORS)
+
+
+class AthenaChecks:
+    """Test-connection checks for Athena."""
+
+    errors = ATHENA_ERRORS
+
+    def __init__(self, client: Engine) -> None:
+        self.client = client
+
+    @check(DatabaseStep.CheckAccess)
+    def check_access(self) -> Evidence:
+        # run_sql, not ping: the URL carries the AWS endpoint host:port but the
+        # transport is HTTPS over botocore, so a raw TCP preflight to it would be
+        # meaningless. A real reachability failure still surfaces via NETWORK_ERRORS.
+        return run_sql(self.client, "SELECT 1", lambda _: "connection established")
+
+    @check(DatabaseStep.GetSchemas)
+    def get_schemas(self) -> Evidence:
+        return list_schemas(self.client)
+
+    @check(DatabaseStep.GetTables)
+    def get_tables(self) -> Evidence:
+        return list_tables(self.client, None)
+
+    @check(DatabaseStep.GetViews)
+    def get_views(self) -> Evidence:
+        return list_views(self.client, None)
 
 
 class AthenaConnection(BaseConnection[AthenaConnectionConfig, Engine]):
@@ -82,56 +185,16 @@ class AthenaConnection(BaseConnection[AthenaConnectionConfig, Engine]):
         return url
 
     def _get_client(self) -> Engine:
-        return create_generic_db_connection(
+        engine = create_generic_db_connection(
             connection=self.service_connection,
             get_connection_url_fn=self.get_connection_url,
             get_connection_args_fn=get_connection_args_common,
         )
+        self._on_close(engine.dispose)
+        return engine
 
-    def test_connection(
-        self,
-        metadata: OpenMetadata,
-        automation_workflow: Optional[AutomationWorkflow] = None,  # noqa: UP045
-        timeout_seconds: Optional[int] = THREE_MIN,  # noqa: UP045
-    ) -> TestConnectionResult:
-        """
-        Test connection. This can be executed either as part
-        of a metadata workflow or during an Automation Workflow
-        """
-        engine = self.client
-
-        def get_test_schema(inspector: Inspector):
-            all_schemas = inspector.get_schema_names()
-            return all_schemas[0] if all_schemas else None
-
-        def custom_executor_for_table():
-            inspector = inspect(engine)
-            test_schema = get_test_schema(inspector)
-            return inspector.get_table_names(test_schema) if test_schema else []
-
-        def custom_executor_for_view():
-            inspector = inspect(engine)
-            test_schema = get_test_schema(inspector)
-            return inspector.get_view_names(test_schema) if test_schema else []
-
-        test_fn = {
-            "CheckAccess": partial(test_connection_engine_step, engine),
-            "GetSchemas": partial(execute_inspector_func, engine, "get_schema_names"),
-            "GetTables": custom_executor_for_table,
-            "GetViews": custom_executor_for_view,
-        }
-
-        result = test_connection_steps(
-            metadata=metadata,
-            test_fn=test_fn,
-            service_type=self.service_connection.type.value,  # pyright: ignore[reportOptionalMemberAccess]
-            automation_workflow=automation_workflow,
-            timeout_seconds=timeout_seconds,
-        )
-
-        kill_active_connections(engine)
-
-        return result
+    def checks(self) -> ChecksProvider:
+        return AthenaChecks(client=self.client)
 
 
 def get_lake_formation_client(connection: AthenaConnectionConfig):
