@@ -426,12 +426,14 @@ git commit -m "feat: SSE ProgressUpdate.globalCounters array replaces single gro
 ### Task 4: Topology runner — track at close + reconcile on materialize
 
 **Files:**
-- Modify: `ingestion/src/metadata/ingestion/api/topology_runner.py` (`_process_node` :290-318; `_multithread_process_entity` close site :388-394)
+- Modify: `ingestion/src/metadata/ingestion/api/topology_runner.py` (`_process_node` :290-318; `_multithread_process_node` open site :236-239; `_multithread_process_entity` close site :388-394)
 - Test: `ingestion/tests/unit/topology/test_topology_runner_progress.py`
 
 **Interfaces:**
 - Consumes: `progress.track(type_)`, `progress.is_reconcilable(type_)`, `progress.reconcile_scope_total(type_, scope, n)` (Task 1); existing `current_progress_path`, `_scope_path_for_node`, `_should_track_progress`.
 - Produces: closing a container node bumps its type's global `done`; a reconcilable container node's real child count reconciles its parent-scoped global total.
+
+**Critical context (the `databaseSchema` node is multithreaded):** the DB topology's `databaseSchema` node has `threads=True`, so in real ingestion it runs through `_multithread_process_node` (which already `list()`-materializes the producer at :224 and calls `open(parent_path, type, len)` at :239), while single-thread configs/tests run it through `_process_node`. Both paths therefore need the reconcile call. Eager-draining the schema producer is already what the multithread path does in production, so it is proven safe — unlike the predecessor's PowerBI leaf case, the schema producer has no per-yield teardown. `track` at close must likewise be in both the `_process_node` close site and the `_multithread_process_entity` close site.
 
 - [ ] **Step 1: Write the failing tests** — add to `tests/unit/topology/test_topology_runner_progress.py` (reuse the file's existing harness for building a runner with a topology; mirror its existing style):
 
@@ -510,6 +512,26 @@ becomes:
 ```
 
 (`entity_type_name` is already a parameter of `_multithread_process_entity` — see its signature at :365.)
+
+- [ ] **Step 4b: Add reconcile at the multithread open site** — in `_multithread_process_node`, the block at lines 238-239:
+
+```python
+        if track_progress:
+            self.progress.open(parent_path, entity_type_name, node_entities_length)
+```
+
+becomes:
+
+```python
+        if track_progress:
+            self.progress.open(parent_path, entity_type_name, node_entities_length)
+            if self.progress.is_reconcilable(entity_type_name) and parent_path:
+                self.progress.reconcile_scope_total(
+                    entity_type_name, parent_path[-1], node_entities_length
+                )
+```
+
+This covers the production path where `databaseSchema` (threads=True) is processed multithreaded; the `_process_node` reconcile in Step 3 covers single-thread configs and the unit tests.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
